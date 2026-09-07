@@ -439,13 +439,10 @@ This test confirms that inventory is validated before the bill is finalized.
 
 ## 📸 Screenshots
 
-Screenshots of the following flows can be added here:
 
-* Telegram billing conversation
 * Credit bill flow
 * Stock checking
-* Insufficient stock validation
-* Generated invoice
+* invoice
 
 Example:
 
