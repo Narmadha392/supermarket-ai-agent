@@ -35,6 +35,14 @@ Bill / Stock / Khata / Invoice
 The AI is mainly responsible for understanding the user's request and selecting the appropriate tools. Important business rules such as stock validation and bill finalization are handled by the backend.
 
 ---
+
+## Live Bot
+
+🤖 **A live bot we can message:** [@nebula_kirana_bot](https://t.me/nebula_kirana_bot)
+
+The bot is deployed on Railway and kept running for reviewers to test the scenarios directly through Telegram.
+
+---
 ## 🎥 Demo Video
 
 [▶ Watch the complete project demo](https://www.loom.com/share/387724771fcb4540a22093a864c5f9f5)
