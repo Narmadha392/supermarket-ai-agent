@@ -942,23 +942,19 @@ get_bill(args) {
   // -----------------------------------------------------
   // GST PDF INVOICE
   //
-  // Only attempt this once the financial transaction has
-  // actually succeeded (result.error is absent and a
-  // bill_id came back — true both for a fresh finalize AND
-  // for the "already finalized" idempotent-retry response).
-  //
-  // getOrCreateInvoicePdf() never re-runs billing logic —
-  // it either resends an existing file or builds one from
-  // the bill already committed in the database — so a
-  // retried finalize_bill call can only ever resend the
-  // same invoice, never double-bill or double-decrement
-  // stock (that guarantee lives in finalizeBill() itself).
+  // Only generate/send the invoice once the finalize itself
+  // succeeded (no error, and a bill_id came back — true both
+  // for a fresh finalize and for an idempotent "already
+  // finalized" retry). getOrCreateInvoicePdf() never re-runs
+  // billing logic — it resends an existing file or builds one
+  // from the bill already committed in the DB — so a retried
+  // finalize_bill can only ever resend the same invoice, never
+  // double-bill or double-decrement stock.
   //
   // A failure here (disk, Telegram, etc.) is logged and
-  // swallowed rather than surfaced as a finalize_bill
-  // error: the sale already happened and must not be
-  // reported as failed, retried, or reversed just because
-  // the PDF could not be generated or sent.
+  // swallowed rather than surfaced as a finalize_bill error:
+  // the sale already happened and must not be reported as
+  // failed just because the PDF could not be generated/sent.
   // -----------------------------------------------------
 
   if (!result.error && result.bill_id) {
@@ -1796,33 +1792,13 @@ it came directly from a tool result.
 // =====================================================
 // PERSISTENT PREFERENCES -> AGENT CONTEXT
 //
-// ROOT CAUSE of the "ignores saved default_payment_mode"
-// bug: tools/preferences.js (setUserPreference /
-// getUserPreference / getAllUserPreferences /
-// getShopSettings) was never wired into bot.js at all — it
-// wasn't required, wasn't a registered tool, and its values
-// never appeared anywhere in systemInstruction. So Gemini had
-// no way to know a preference existed; whatever it did with
-// "credit" before was only it remembering something said
-// earlier in that same chat's conversation, not an actual
-// read of user_preferences. On a fresh chat (or a different
-// chat_id, or after restart/context loss) there was nothing
-// to fall back to, so it defaulted to "cash".
-//
-// FIX: build the system instruction dynamically per request,
-// by loading this chat's row(s) from user_preferences (and
-// the shop-wide row from shop_settings) fresh from SQLite
-// every time, and appending them as an explicit block Gemini
-// must follow. chat_id is passed in by the caller (runAgent)
-// each time — never hardcoded here.
-//
-// SECOND FIX (this pass): Gemini also had no WAY to write a
-// new preference — set_user_preference / set_shop_setting are
-// now registered as real tools above (see section 3 and the
-// STANDING PREFERENCES system-instruction block), so a
-// statement like "always assume UPI unless I say cash" now
-// results in an actual DB write, not just a confirming
-// sentence with nothing behind it.
+// Loads this chat's saved preferences (and shop-wide
+// settings) fresh from SQLite on every request and appends
+// them to the system instruction, so Gemini always sees the
+// current default_payment_mode / preferred_brand instead of
+// only whatever it remembers from earlier in the
+// conversation. chat_id is passed in by the caller each time
+// — never hardcoded here.
 // =====================================================
 
 function buildPreferencesBlock(chatId) {
@@ -1980,25 +1956,15 @@ const chatInteractions = new Map();
 // =====================================================
 // PENDING CREDIT-BILL STATE
 //
-// Fixes the loop where start_bill fails with "A customer
-// name is required to start a credit bill" and the bot asks
-// the user "Whose khata should this bill be added to?" —
-// previously the user's next reply (e.g. "Ramesh") was sent
-// to Gemini as a brand-new, unrelated message and the
-// original bill request was lost.
-//
-// When that specific error happens, runAgent() stops the
-// tool-calling loop immediately (see below) instead of
-// letting Gemini keep guessing, and records the ORIGINAL
-// user text here, keyed by Telegram chat_id so one user's
-// pending request can never leak into another chat's
-// conversation.
-//
-// The next message the bot receives for that same chat_id
-// is then treated as the customer name and combined with the
-// original request before being sent to Gemini, so the bill
-// (payment mode credit + items) is resumed instead of started
-// over. See bot.on('message', ...) below.
+// When start_bill fails because a credit bill has no
+// customer name, the bot asks "Whose khata should this bill
+// be added to?" The next reply (e.g. "Ramesh") needs to
+// resume that SAME bill request, not start a new one — so
+// the original user text is saved here, keyed by Telegram
+// chat_id, and spliced back together with the customer name
+// on the next message (see bot.on('message', ...) below).
+// Scoped per chat_id so one user's pending request can never
+// leak into another chat.
 // =====================================================
 const pendingCreditBillRequests = new Map();
 
@@ -2176,20 +2142,10 @@ if (previousInteractionId) {
 // Cancellation must be explicitly requested by the user.
 if (call.name === 'cancel_bill') {
 
-  // ===== TEMP DEBUG: remove after diagnosis =====
-  console.log('[CANCEL-DEBUG] chatId:', chatId, '(type:', typeof chatId, ')');
-  console.log('[CANCEL-DEBUG] userText:', JSON.stringify(userText));
-  console.log('[CANCEL-DEBUG] call.arguments:', JSON.stringify(call.arguments));
-  // ===== END TEMP DEBUG =====
-
   const userExplicitlyCancelled =
     /\b(cancel|cancel the bill|cancel bill|discard the bill)\b/i.test(userText);
 
   if (!userExplicitlyCancelled) {
-
-    // ===== TEMP DEBUG: remove after diagnosis =====
-    console.log('[CANCEL-DEBUG] branch chosen: BLOCKED_NOT_EXPLICIT');
-    // ===== END TEMP DEBUG =====
 
     result = {
       error:
@@ -2232,26 +2188,13 @@ if (call.name === 'cancel_bill') {
     call.arguments.bill_id ??
     call.arguments.bill_number;
 
-  // ===== TEMP DEBUG: remove after diagnosis =====
-  console.log('[CANCEL-DEBUG] explicitBillId from Gemini args:', explicitBillId);
-  // ===== END TEMP DEBUG =====
-
   let resolvedBillId = explicitBillId;
 
   if (resolvedBillId == null) {
 
     const pendingBills = getPendingBillsByChat(chatId);
 
-    // ===== TEMP DEBUG: remove after diagnosis =====
-    console.log('[CANCEL-DEBUG] pending bills found for this chatId:', JSON.stringify(pendingBills));
-    console.log('[CANCEL-DEBUG] pending bill count:', pendingBills.length);
-    // ===== END TEMP DEBUG =====
-
     if (pendingBills.length === 0) {
-
-      // ===== TEMP DEBUG: remove after diagnosis =====
-      console.log('[CANCEL-DEBUG] branch chosen: NO_PENDING_BILLS');
-      // ===== END TEMP DEBUG =====
 
       result = {
         message: 'There is no pending bill to cancel right now.'
@@ -2274,10 +2217,6 @@ if (call.name === 'cancel_bill') {
       continue;
 
     } else if (pendingBills.length > 1) {
-
-      // ===== TEMP DEBUG: remove after diagnosis =====
-      console.log('[CANCEL-DEBUG] branch chosen: MULTIPLE_PENDING_ASK_USER');
-      // ===== END TEMP DEBUG =====
 
       result = {
         message:
@@ -2305,24 +2244,10 @@ if (call.name === 'cancel_bill') {
 
     } else {
 
-      // ===== TEMP DEBUG: remove after diagnosis =====
-      console.log('[CANCEL-DEBUG] branch chosen: AUTO_RESOLVED_SINGLE_PENDING');
-      // ===== END TEMP DEBUG =====
-
       resolvedBillId = pendingBills[0].id;
 
     }
-  } else {
-
-    // ===== TEMP DEBUG: remove after diagnosis =====
-    console.log('[CANCEL-DEBUG] branch chosen: EXPLICIT_BILL_ID_FROM_GEMINI');
-    // ===== END TEMP DEBUG =====
-
   }
-
-  // ===== TEMP DEBUG: remove after diagnosis =====
-  console.log('[CANCEL-DEBUG] final resolvedBillId passed to cancelBill:', resolvedBillId);
-  // ===== END TEMP DEBUG =====
 
   result = cancelBill(resolvedBillId);
 
@@ -2389,12 +2314,21 @@ if (!fn) {
 
     // ==========================================
     // ENFORCE SAVED PAYMENT PREFERENCE
+    //
+    // Gemini can pass paymentMode explicitly even when the
+    // system prompt asked it to omit the field, which would
+    // silently defeat a saved default_payment_mode. So this
+    // resolves the payment mode deterministically instead of
+    // trusting whatever Gemini decided to send: an explicit
+    // payment word in the user's current message always wins;
+    // otherwise the saved preference (read fresh from SQLite)
+    // wins; only if neither exists does Gemini's own value
+    // pass through.
     // ==========================================
     if (call.name === 'start_bill') {
 
       const text = userText.toLowerCase();
 
-      // Check if user explicitly mentioned a payment mode
       let explicitPaymentMode = null;
 
       if (/\bcash\b/i.test(text)) {
@@ -2407,36 +2341,19 @@ if (!fn) {
         explicitPaymentMode = 'credit';
       }
 
-      // -----------------------------------------------------
-      // Load saved preferences for this Telegram user.
-      //
-      // FIX: getAllUserPreferences(chatId) returns an OBJECT
-      // shaped { preferences: [ {key, value}, ... ] }, not an
-      // array. The previous code did
-      // `Array.isArray(preferences) ? ... : null`, which was
-      // always false for this wrapper object, so
-      // savedPreference was unconditionally null regardless of
-      // what SQLite actually had stored (confirmed by the
-      // "[PAYMENT DEBUG] Saved preference: undefined" bug
-      // report even though Raw preferences clearly contained
-      // default_payment_mode: 'credit'). Unwrap it the same
-      // way buildPreferencesBlock() above already does.
-      // -----------------------------------------------------
+      // getAllUserPreferences(chatId) returns
+      // { preferences: [ {key, value}, ... ] }, so unwrap it
+      // the same way buildPreferencesBlock() does above.
       const prefsResult = getAllUserPreferences(chatId);
       const preferences = (prefsResult && prefsResult.preferences) || [];
 
-console.log(
-  '[PAYMENT DEBUG] Raw preferences:',
-  prefsResult
-);
+      const savedPreference = preferences.find(
+        pref => pref.key === 'default_payment_mode'
+      );
 
-const savedPreference = preferences.find(
-  pref => pref.key === 'default_payment_mode'
-);
-
-const savedPaymentMode = savedPreference
-  ? savedPreference.value
-  : undefined;
+      const savedPaymentMode = savedPreference
+        ? savedPreference.value
+        : undefined;
 
       // Explicit user instruction has highest priority
       const resolvedPaymentMode =
@@ -2444,32 +2361,6 @@ const savedPaymentMode = savedPreference
         savedPaymentMode ||
         call.arguments.paymentMode;
 
-      console.log(
-        '[PAYMENT DEBUG] chatId:',
-        chatId
-      );
-
-      console.log(
-        '[PAYMENT DEBUG] Saved preference:',
-        savedPaymentMode
-      );
-
-      console.log(
-        '[PAYMENT DEBUG] Explicit payment:',
-        explicitPaymentMode
-      );
-
-      console.log(
-        '[PAYMENT DEBUG] Gemini requested:',
-        call.arguments.paymentMode
-      );
-
-      console.log(
-        '[PAYMENT DEBUG] Final resolved:',
-        resolvedPaymentMode
-      );
-
-      // Force the correct payment mode
       call.arguments.paymentMode = resolvedPaymentMode;
 
     }
